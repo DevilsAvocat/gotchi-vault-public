@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-pragma solidity 0.8.11;
+pragma solidity ^0.8.11;
 
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
@@ -14,6 +14,36 @@ import "./interfaces/IERC1155.sol";
 import "./interfaces/StakingContract.sol";
 import "./interfaces/Raffle.sol";
 import "./interfaces/IAavegotchi.sol";
+import "./interfaces/IAaveIncentivesController.sol";
+import "./interfaces/ILendingPool.sol";
+
+interface Uni {
+    function swapExactTokensForTokens(
+        uint256,
+        uint256,
+        address[] calldata,
+        address,
+        uint256
+    ) external;
+}
+
+//the multi-sig owners define these parameters, but allow a single wallet to execute minting, 
+//to minimize the number of multi-sig txs required
+struct MintingSettings{
+    //Unix time -- how frequently frens can be minted
+    uint256 allowedFrequency;
+    //the Unix time of the last minting of tickets
+    uint256 lastExecuted;
+    //the number of frens the vault had the last time tickets were minted -- used to see
+    //how many new frens have accrued
+    uint256 lastFrens; 
+    //an array storing how many frens it costs for each ticket
+    uint256[] frensCost;
+    //what percentage of new frens should go towards each type of raffle ticket.  This is a number from 0-100
+    uint256[] mintPercentages;
+    //the approved prices that tickets may be sold for -- each array entry corresponds to a type of ticket
+    uint256[] salesPrices;
+}
 
 
 // this contract draws from QiDao's camToken
@@ -39,6 +69,31 @@ contract vGHST is Initializable, ERC20Upgradeable, PausableUpgradeable {
 
     uint256 public totalFeesCollected;
 
+    MintingSettings mintingSettings;
+
+    mapping(address => bool) approvedUsers;
+
+    //THESE ARE LEGACY VARIABLES AND ARE NOT USED IN THE CONTRACT
+    uint256 allowedFrequency;
+    //the Unix time of the last minting of tickets
+    uint256 lastExecuted;
+    //the number of frens the vault had the last time tickets were minted -- used to see
+    //how many new frens have accrued
+    uint256 lastFrens; 
+    //what percentage of new frens should go towards each type of raffle ticket
+    uint256[] mintPercentages;
+    //the approved prices that tickets may be sold for -- each array entry corresponds to a type of ticket
+    uint256[] salesPrices;
+    //THIS ENDS THE LEGACY VARIABLES 
+
+    //vars to be used once amGHST goes live
+    address public amGHST;
+    address public AaveContract;
+    address public wMatic;
+    address public weth;
+    address public LENDING_POOL;
+    address public uni;
+
 
     // Define the token contract
     function initialize(
@@ -60,14 +115,23 @@ contract vGHST is Initializable, ERC20Upgradeable, PausableUpgradeable {
         _;
     }
 
-    function pause() public whenNotPaused{
-        _pause();
+    modifier onlyApproved() {
+        require(msg.sender ==  owner || approvedUsers[msg.sender], "onlyApproved: not allowed");
+        _;
     }
 
-    function unpause() public whenPaused{
-        _unpause();
+    function setApproved(address _user, bool _approval) public onlyOwner{
+        approvedUsers[_user] = _approval;
     }
 
+    function isApproved(address _user) public view returns(bool){
+        return approvedUsers[_user];
+    }
+
+    function pause(bool _setPause) public onlyOwner{
+        if(_setPause){_pause();}
+        else _unpause();
+    }
 
     
     function updateOwner(address _owner) public onlyOwner {
@@ -125,12 +189,28 @@ contract vGHST is Initializable, ERC20Upgradeable, PausableUpgradeable {
         return totalFeesCollected;
     }
 
+    function setMintingSettings(uint256 _frequency, uint256[] calldata _percentages, 
+        uint256[] calldata _prices, uint256[] calldata _costs) public onlyOwner{
+
+        mintingSettings.allowedFrequency = _frequency;       
+        mintingSettings.mintPercentages = _percentages;
+        mintingSettings.salesPrices = _prices;
+        mintingSettings.frensCost = _costs;
+
+    }
+
+    function getMintingSettings() public view returns(MintingSettings memory){
+        return mintingSettings;
+    }
+
     /////////////////////////////////////////////////////////////////////////////////////
     //In this section, we pull from Qidao's camToken implementation to allow users to own
     //a fraction of the deposited pot, which can be compounded.  Have added view functions to 
     //see how much total GHST is held by the contract, and to convert vGHST to corresponding GHST
 
     // Locks ghst and mints our vGHST (shares) -- this function is largely from QiDao code
+
+    //note: will need to upgrade this code once Aave rewards go live, to go into amGHST
     function enter(uint256 _amount) public whenNotPaused returns(uint256)  {
         
         //the total "pool" of GHST held is a combination of the GHST directly held, and the GHST staked
@@ -138,9 +218,14 @@ contract vGHST is Initializable, ERC20Upgradeable, PausableUpgradeable {
 
         uint256 totalShares = totalSupply(); // Gets the amount of vGHST in existence
 
-        // Lock the Token in the contract
+        // Lock the GHST in the contract
         IERC20Upgradeable(ghstAddress).transferFrom(msg.sender, address(this), _amount);
-        StakingContract(stakingAddress).stakeIntoPool(ghstAddress, _amount);
+
+        // Deposit the GHST for amGHST at Aave -- should receive _amount of amGHST
+        ILendingPool(LENDING_POOL).deposit(ghstAddress, _amount, address(this), 0);
+
+        // Deposit the amGHST for frens
+        StakingContract(stakingAddress).stakeIntoPool(amGHST, _amount);
 
         if (totalShares == 0 || totalTokenLocked == 0) { // If no vGHST exists, mint it 1:1 to the amount put in
                 _mint(msg.sender, _amount);
@@ -154,11 +239,11 @@ contract vGHST is Initializable, ERC20Upgradeable, PausableUpgradeable {
 
     //this function is used for the Gotchi Vault to contract to "collect" vGHST fees and "send"
     //it back to the vGHST contract
-    function burn(uint256 _share) public whenNotPaused{
+    /*function burn(uint256 _share) public whenNotPaused{
         require(balanceOf(msg.sender) >= _share, "Amount to burn exceeds balance");
 
         _burn(msg.sender, _share);
-    }
+    }*/
 
 
     // claim ghst by burning vGHST -- this function is largely from QiDao code
@@ -170,7 +255,11 @@ contract vGHST is Initializable, ERC20Upgradeable, PausableUpgradeable {
 
             //if balanceof(this) < ghst Amount (because GHST is staked for frens), unstake ghstAmount
             if(ghstAmount > IERC20Upgradeable(ghstAddress).balanceOf(address(this))){
-                StakingContract(stakingAddress).withdrawFromPool(ghstAddress, ghstAmount);
+                //first unstake the amGHST
+                StakingContract(stakingAddress).withdrawFromPool(amGHST, ghstAmount);
+
+                //now withdraw corresponding GHST from Aave
+                ILendingPool(LENDING_POOL).withdraw(ghstAddress, ghstAmount, address(this));
             }
             _burn(msg.sender, _share);
             
@@ -198,6 +287,7 @@ contract vGHST is Initializable, ERC20Upgradeable, PausableUpgradeable {
     }
 
     //a function to get the total GHST held by an address between the wallet AND staked
+    //todo: confirm that the below works for amGHST staked GHST -- may need to change the address 
     function totalGHST(address _user) public view returns(uint256 _totalGHST){
         //get the total amount of GHST held directly in the wallet
         uint256 totalGHSTHeld = IERC20Upgradeable(ghstAddress).balanceOf(_user);
@@ -207,8 +297,10 @@ contract vGHST is Initializable, ERC20Upgradeable, PausableUpgradeable {
         PoolStakedOutput[] memory poolsStaked = StakingContract(stakingAddress).stakedInCurrentEpoch(_user);
         for(uint256 i = 0; i < poolsStaked.length; i++){
             if(poolsStaked[i].poolAddress == ghstAddress){
-                totalGHSTStaked = poolsStaked[i].amount;
-                break;
+                totalGHSTStaked += poolsStaked[i].amount;
+            }
+            else if(poolsStaked[i].poolAddress == amGHST){
+                totalGHSTStaked += poolsStaked[i].amount;
             }
 
         }
@@ -234,6 +326,74 @@ contract vGHST is Initializable, ERC20Upgradeable, PausableUpgradeable {
     //In this section, we have wrapper functions that can be called by the owner, to stake and 
     //unstake GHST, claim raffle tickets, enter raffle tickets into raffles, sell ERC1155 items on baazaar
     //this is the core of the "compounding" part of this contract, and can only be called by the owner
+
+    //This first function is the key for automating minting and ticket sales.  An approved wallet
+    //(a bot) can call the function at approved intervals.  Only the owner of the contract can adjust the 
+    //parameters
+    function mintAndSell() public onlyApproved{
+        //must wait the required interval since the last minting
+        require(block.timestamp - mintingSettings.lastExecuted >= mintingSettings.allowedFrequency,"Need to wait to mint more");
+        
+        //we check how many new frens we've accrued since last minting -- we want the differential since the last claiming
+        uint256 newFrens = frens() - mintingSettings.lastFrens;
+
+        //we might need to pull some GHST out of the staking pool to pay the baazaar fees
+        if(IERC20Upgradeable(ghstAddress).balanceOf(address(this)) < 1e18){
+            StakingContract(stakingAddress).withdrawFromPool(ghstAddress, 5e18);
+        }
+
+        
+
+        //note: this will end up with leftover frens since the numbers won't always line up.  we can just leave them
+        //sitting (what i've done here) or go back in at the end and mint the remainder in the smallest denominator
+        //there are 7 ticket types: common, uncommon, rare, legendary, mythical, godlike, drop
+        for(uint i = 0; i < 7; i++){
+            
+            //we may not want to mint all the ticket types -- check if the percentage >0
+            if(mintingSettings.mintPercentages[i] > 0){
+
+                //first, we find the number of frens to spend on each raffle item
+                uint256 frensToSpend = (mintingSettings.mintPercentages[i] * newFrens) / 100;
+
+                //next, we figure out how many raffle tickets that number of frens corresponds to.
+                //solidity division rounds down, so we get the max number of tickets of each type for that amount of frens
+                uint256 ticketsToBuy = frensToSpend / mintingSettings.frensCost[i];
+
+                //now we claim that number of tickets
+                uint256[] memory ticketIds = new uint256[](1); 
+                uint256[] memory ticketQuants = new uint256[](1);
+                ticketIds[0] = i;
+                ticketQuants[0] = ticketsToBuy;
+                //todo: can maybe improve gas efficiency by doing a single claim call after we iterate through the 
+                //array -- but then need a second loop to do the baazaar listings.  something to consider
+                
+                if(ticketsToBuy > 0){
+                    StakingContract(stakingAddress).claimTickets(ticketIds, ticketQuants);
+
+                    //if we already have a listing with this type of ticket, Aavegotchi won't let us list a new one
+                    //so we have to cancel and then combine the tickets
+
+                    //get the preexisting listing, and number of tickets -- numTickets defaults to 0 if there's no listing
+                    ERC1155Listing memory currentListing = IAavegotchi(diamondAddress).getERC1155ListingFromToken(stakingAddress, i, address(this));
+                    uint256 numTickets = currentListing.quantity;
+
+                    //now we cancel the prior listing
+                    IAavegotchi(diamondAddress).cancelERC1155Listing(currentListing.listingId);
+                    
+                    //and finally, we list the tickets on the baazaar
+                    IAavegotchi(diamondAddress).setERC1155Listing(stakingAddress, i, ticketsToBuy + numTickets, mintingSettings.salesPrices[i]);
+                }
+                
+            }
+        }
+
+
+        //and we record the ending information to refer to in the future
+        mintingSettings.lastExecuted = block.timestamp;
+        mintingSettings.lastFrens = frens();
+    }
+
+    
     
     /////////////////////////////////////////////////////////////////////////////////////
     //Wrapper functions for the staking diamond contract
@@ -245,9 +405,7 @@ contract vGHST is Initializable, ERC20Upgradeable, PausableUpgradeable {
         StakingContract(stakingAddress).stakeIntoPool(_poolContractAddress, _amount);
     }
 
-    
-
-    function stakeAllGHST() public onlyOwner{
+    function stakeAllGHST() public onlyApproved{
         StakingContract(stakingAddress).stakeIntoPool(ghstAddress, IERC20Upgradeable(ghstAddress).balanceOf(address(this)));
     }
 
@@ -257,6 +415,7 @@ contract vGHST is Initializable, ERC20Upgradeable, PausableUpgradeable {
 
     function claimTickets(uint256[] calldata _ids, uint256[] calldata _values) public onlyOwner{
         StakingContract(stakingAddress).claimTickets(_ids, _values);
+        mintingSettings.lastFrens = frens();
     }
 
     function convertTickets(uint256[] calldata _ids, uint256[] calldata _values) public onlyOwner{
@@ -281,9 +440,12 @@ contract vGHST is Initializable, ERC20Upgradeable, PausableUpgradeable {
     //winning vouchers into ERC721 tokens (ERC1155 tokens are sent directly to the winner using claimPrize), so we need 
     //an upgradable contract or EOA to be the one actually claiming the ERC721 token from the ERC1155 vouchers
     //todo: can remove this if we end up deploying vGHST as upgradable
-    function withdrawVouchers(address _voucherAddress, uint256 _id, uint256 _value) public whenNotPaused {
+    function withdrawERC1155(address _erc1155Address, uint256[] calldata _ids, uint256[] calldata _values) public whenNotPaused {
         require(msg.sender == owner || msg.sender == gotchiVaultAddress, "withdrawVouchers: can only be called by contract owner or the gotchiVault");
-        IERC1155(_voucherAddress).safeTransferFrom(address(this), gotchiVaultAddress, _id, _value, "");
+        require(_ids.length == _values.length, "ids and values must be same length");
+
+        IERC1155(_erc1155Address).safeBatchTransferFrom(address(this), msg.sender, _ids, _values, "");
+
     }
 
     /////////////////////////////////////////////////////////////////////////////////////
@@ -296,6 +458,21 @@ contract vGHST is Initializable, ERC20Upgradeable, PausableUpgradeable {
             StakingContract(stakingAddress).withdrawFromPool(ghstAddress, 5e18);
         }
         IAavegotchi(diamondAddress).setERC1155Listing(_erc1155TokenAddress, _erc1155TypeId, _quantity, _priceInWei);
+    }
+
+    function batchSetERC1155Listing(address _erc1155TokenAddress, uint256[] calldata _erc1155TypeIds, uint256[] calldata _quantities, 
+        uint256[] calldata _pricesInWei) public onlyOwner{
+        
+        require(_erc1155TypeIds.length == _quantities.length && _quantities.length == _pricesInWei.length, "inputs must be same length");
+        //we need at least 0.1 GHST (1e17) per listing in the wallet to pay the listing fee
+        //if we don't have that much, pull the required amount from staking pool
+        if(IERC20Upgradeable(ghstAddress).balanceOf(address(this)) < _erc1155TypeIds.length*1e17){
+            StakingContract(stakingAddress).withdrawFromPool(ghstAddress, _erc1155TypeIds.length*1e17);
+        }
+
+        for(uint256 i = 0; i < _erc1155TypeIds.length; i++){
+            IAavegotchi(diamondAddress).setERC1155Listing(_erc1155TokenAddress, _erc1155TypeIds[i], _quantities[i], _pricesInWei[i]);
+        }
     }
     
     function cancelERC1155Listing(uint256 _listingId) public onlyOwner{
@@ -315,7 +492,79 @@ contract vGHST is Initializable, ERC20Upgradeable, PausableUpgradeable {
     }
 
     /////////////////////////////////////////////////////////////////////////////////////
+    /////////////////////////////////////////////////////////////////////////////////////   
+    //Here we are preemptively implementing the Aave code in preparation for amGHST token
 
+    //to be called by the owner multi-sig once Aave is live
+    function setAave(
+        address  _Token,
+        address  _AaveContract,
+        address  _wMatic,
+        address  _LENDING_POOL,
+        address  _uni,
+        address _weth) public onlyOwner
+    {
+        amGHST = _Token;
+        AaveContract = _AaveContract;
+        wMatic = _wMatic;
+        LENDING_POOL = _LENDING_POOL;
+        uni = _uni;
+        weth = _weth;
+
+        //need to approve Aave to take GHST, and Aavegotchi to take amGHST
+        IERC20Upgradeable(ghstAddress).approve(AaveContract, MAX_INT);
+        IERC20Upgradeable(amGHST).approve(stakingAddress, MAX_INT);
+
+    }
+
+    //taken from camToken code
+    function claimAaveRewards() public onlyApproved() {
+        // we're only checking for one asset (Token which is an interest bearing amToken)
+        address[] memory rewardsPath = new address[](1);
+                rewardsPath[0] = amGHST;
+
+        // check how many matic are available to claim
+        uint256 rewardBalance = IAaveIncentivesController(AaveContract).getRewardsBalance(rewardsPath, address(this));
+
+        // we should only claim rewards if its over 0.
+        if(rewardBalance > 2){
+            IAaveIncentivesController(AaveContract).claimRewards(rewardsPath, rewardBalance, address(this));
+        }
+    }
+    
+    //taken from camToken code
+    function harvestMaticIntoToken() public onlyApproved() {
+        // claims any available Matic from the Aave Incentives contract.
+
+        //get our current matic balance
+        uint256 _wmaticBalance = IERC20Upgradeable(wMatic).balanceOf(address(this));
+
+        if(_wmaticBalance > 2) {
+            address[] memory path = new address[](3);
+                path[0] = wMatic;
+                path[1] = weth;
+                path[2] = ghstAddress;
+    
+            IERC20Upgradeable(wMatic).safeApprove(uni, 0);
+            IERC20Upgradeable(wMatic).safeApprove(uni, _wmaticBalance);
+            
+            // swap the rewards wmatic for GHST
+            Uni(uni).swapExactTokensForTokens(_wmaticBalance, uint256(0), path, address(this), block.timestamp.add(1800));
+            
+            //get the new balance of GHST
+            uint256 newBalance = IERC20Upgradeable(ghstAddress).balanceOf(address(this));
+
+            // Just being safe
+            IERC20Upgradeable(ghstAddress).safeApprove(LENDING_POOL, 0);
+            // Approve Transfer _amount aave to lending pool
+            IERC20Upgradeable(ghstAddress).safeApprove(LENDING_POOL, newBalance);
+            // then we need to deposit it into the lending pool -- should receive amGHST in return at 1:1 rate
+            ILendingPool(LENDING_POOL).deposit(ghstAddress, newBalance, address(this), 0);
+            // deposit amGHST into aavegotchi pool for frens
+            StakingContract(stakingAddress).stakeIntoPool(amGHST, newBalance);
+
+        }
+    }
     
 
     /////////////////////////////////////////////////////////////////////////////////////

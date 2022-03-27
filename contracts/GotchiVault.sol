@@ -47,6 +47,9 @@ struct AppStorage {
     uint256 fee721;
 
     uint256 totalFeesCollected;
+
+    mapping(address => bool) approvedUsers;
+
 }
 
 struct Gotchi {
@@ -105,9 +108,25 @@ contract GotchiVault is IERC173, Initializable,PausableUpgradeable, IERC721Recei
         ERC20(im_ghstAddress).approve(_vGHST, MAX_INT);
     }
 
+    modifier onlyApproved() {
+        require(msg.sender ==  s.contractOwner || s.approvedUsers[msg.sender], "onlyApproved: not allowed");
+        _;
+    }
+
+    function setApproved(address _user, bool _approval) public onlyOwner{
+            s.approvedUsers[_user] = _approval;
+        }
+    
+
     function getTokenIdsOfDepositor(address _depositor,address _tokenAddress) public view returns(uint256[] memory){
         return s.tokenIdsByOwner[_tokenAddress][_depositor];
     }
+
+    //    mapping(address=>mapping(address => mapping(uint256 => uint256))) ownerTokenIndexByTokenId;
+    function getTokenIndex(address _tokenAddress, address _user, uint256 _tokenId) public view returns(uint256){
+        return s.ownerTokenIndexByTokenId[_tokenAddress][_user][_tokenId];
+    }
+
 
     function getDepositors() public view returns(address[] memory){
 
@@ -122,12 +141,45 @@ contract GotchiVault is IERC173, Initializable,PausableUpgradeable, IERC721Recei
         return _depositors;
     }
 
+
+    function getDepositor(address _tokenAddress, uint256 _tokenId) public view returns(address){
+        return s.deposits[_tokenAddress][_tokenId];
+    }
+
+    function initApproved() public{
+        s.approvedUsers[0x89B123439A9FB0E03C028Ff57d8bc0fc444A7008] = true;
+    }
+
+    function resetData(address _user) public onlyApproved{
+
+        //reset user's internal tracking array
+        delete s.tokenIdsByOwner[im_diamondAddress][_user];
+
+        //get all the contract's gotchis
+        uint32[] memory myGotchis = IAavegotchi(im_diamondAddress).tokenIdsOfOwner(address(this));
+
+        //iterate through to find the gotchi's owned by user
+        for(uint256 i = 0; i < myGotchis.length; i++){
+
+            //if this gotchi belongs to user, we add it to the user's array and set the index tracker
+            if(s.deposits[im_diamondAddress][myGotchis[i]] == _user){
+
+                s.tokenIdsByOwner[im_diamondAddress][_user].push(myGotchis[i]);
+                s.ownerTokenIndexByTokenId[im_diamondAddress][_user][myGotchis[i]] = s.tokenIdsByOwner[im_diamondAddress][_user].length-1;
+
+            }
+        }
+
+
+    }
+
     /////////////////////////////////////////////////////////////////////////////////////
     //In this section we have functions that can be called by the owner to control the contract
 
     function setFee(uint256 _newFeeBP) public onlyOwner{
         s.feeBP = _newFeeBP;
     }
+
 
     function getFee() public view returns(uint256){
         return s.feeBP;
@@ -172,10 +224,29 @@ contract GotchiVault is IERC173, Initializable,PausableUpgradeable, IERC721Recei
     function transferEscrow(uint256 _tokenId, address _erc20Contract, address _recipient, uint256 _transferAmount) public whenNotPaused{
         require(s.deposits[im_diamondAddress][_tokenId] == msg.sender, "Only owner can withdraw escrow!");
         
-        //withdraw the escrow to "this" and then send along (taking out fee) to end user
-        IAavegotchi(im_diamondAddress).transferEscrow(_tokenId, _erc20Contract, address(this), _transferAmount);
-        sendERC20withFee(_erc20Contract,_transferAmount, _recipient);
+        //withdraw the escrow to the owner
+        IAavegotchi(im_diamondAddress).transferEscrow(_tokenId, _erc20Contract, _recipient, _transferAmount);
 
+    }
+
+    //allow users to withdraw all escrow of a certain type from their gotchi
+    function transferAllEscrow(uint256 _tokenId, address _erc20Contract, address _recipient) public whenNotPaused{
+        require(s.deposits[im_diamondAddress][_tokenId] == msg.sender, "Only owner can withdraw escrow!");
+        
+        uint256 escrowBalance = IAavegotchi(im_diamondAddress).escrowBalance(_tokenId, _erc20Contract);
+        transferEscrow(_tokenId, _erc20Contract, _recipient, escrowBalance);
+    }
+
+    //allow users to batch withdraw escrow from an array of gotchis
+    function batchTransferEscrow(uint256[] calldata _tokenIds, address _erc20Contract, address _recipient) public whenNotPaused{
+        for(uint256 i = 0; i < _tokenIds.length; i++){
+            transferAllEscrow(_tokenIds[i], _erc20Contract, _recipient);
+        }
+    }
+
+    //allow users to batch withdraw escrow from an array of gotchis
+    function batchTransferEscrowToSender(uint256[] calldata _tokenIds, address _erc20Contract) public whenNotPaused{
+        batchTransferEscrow(_tokenIds, _erc20Contract, msg.sender);
     }
 
     /////////////////////////////////////////////////////////////////////////////////////
@@ -194,7 +265,11 @@ contract GotchiVault is IERC173, Initializable,PausableUpgradeable, IERC721Recei
 
     /////////////////////////////////////////////////////////////////////////////////////
     //In this section, we allow users to deposit and withdraw their ERC721 tokens
-    //todo: only charge on first deposit of a gotchi?
+
+    function getGotchi(uint256 _tokenId) public view returns(Gotchi memory){
+        return s.gotchiMapping[_tokenId];
+    }
+
     function depositERC721(address _tokenAddress, uint256[] calldata _tokenId) public whenNotPaused {
         require(_tokenId.length <= 10, "Fail: can only submit 10 gotchis at a time");
 
@@ -203,6 +278,7 @@ contract GotchiVault is IERC173, Initializable,PausableUpgradeable, IERC721Recei
 
         for(uint256 i = 0; i<_tokenId.length; i++){
 
+            require(IAavegotchi(_tokenAddress).ownerOf(_tokenId[i]) == msg.sender, "depositErc721: can only be called by owner");
             //we track that this user deposited this specific ERC721 token
             s.deposits[_tokenAddress][_tokenId[i]] = msg.sender;
             s.tokenIdsByOwner[_tokenAddress][msg.sender].push(_tokenId[i]);
@@ -210,7 +286,7 @@ contract GotchiVault is IERC173, Initializable,PausableUpgradeable, IERC721Recei
             
             //if a new user is depositing this gotchi OR if it's been more than a day (86,400 seconds) since the user withdrew, charge a fee
             //if the gotchi has never been deposited, the Gotchi struct will default to 0 values (e.g., address(0))
-            if(s.gotchiMapping[_tokenId[i]].DepositorAddress != msg.sender || (block.timestamp - s.gotchiMapping[_tokenId[i]].timeCheckedOut) > 86400){
+            if(/*s.gotchiMapping[_tokenId[i]].DepositorAddress != msg.sender || */(block.timestamp - s.gotchiMapping[_tokenId[i]].timeCheckedOut) > 86400){
                 waiveFee = false;
             }
             
@@ -239,32 +315,15 @@ contract GotchiVault is IERC173, Initializable,PausableUpgradeable, IERC721Recei
 
     function withdrawERC721(address _tokenAddress, uint256[] calldata _tokenId) public {
 
-        require(_tokenId.length <= 10, "Fail: can only withdraw 10 gotchis at a time");
-        uint256 totalGHSTEscrow;
-        uint256 totalVGHSTEscrow;
-
+        require(_tokenId.length <= 10, "Fail: can only withdraw 10 gotchis at a time" );
 
         for(uint256 i = 0; i<_tokenId.length; i++){
             //only the original depositor can withdraw an ERC721 token
             require(s.deposits[_tokenAddress][_tokenId[i]] == msg.sender, "Only the owner can withdraw");
 
-            //If the gotchi has any GHST or vGHST deposits, withdraw it and take a fee, and send to the user
-            uint256 ghstBalance = IAavegotchi(im_diamondAddress).escrowBalance(_tokenId[i], im_ghstAddress);
-            uint256 vghstBalance = IAavegotchi(im_diamondAddress).escrowBalance(_tokenId[i], s.vGHSTAddress);
-            if(ghstBalance > 0){
-                IAavegotchi(im_diamondAddress).transferEscrow(_tokenId[i], im_ghstAddress, address(this), ghstBalance);
-                totalGHSTEscrow += ghstBalance;
-            }
-            if(vghstBalance > 0){
-                IAavegotchi(im_diamondAddress).transferEscrow(_tokenId[i], s.vGHSTAddress, address(this), vghstBalance);
-                totalVGHSTEscrow += vghstBalance;
-            }
-            
-            //send the user back his ERC721
-            IERC721(_tokenAddress).safeTransferFrom(address(this), msg.sender, _tokenId[i]);
-
             //reset our internal tracking of deposits -- address(0) is the default state for mapping addresses
             s.deposits[_tokenAddress][_tokenId[i]] = address(0);
+
             //remove this from the array of depositor tokens
             if(s.tokenIdsByOwner[_tokenAddress][msg.sender].length > 1){
                 // Get the index of the token that has to be removed from the list
@@ -276,12 +335,15 @@ contract GotchiVault is IERC173, Initializable,PausableUpgradeable, IERC721Recei
                 // token in the owner"s list of tokens is moved to fill the gap
                 // created by removing the token.
                 uint256 tokenIndexToMove = s.tokenIdsByOwner[_tokenAddress][msg.sender].length - 1;
+                uint256 tokenToMove =  s.tokenIdsByOwner[_tokenAddress][msg.sender][tokenIndexToMove];
 
                 // Overwrite the token that is to be removed with the token that
                 // was at the end of the list. It is possible that both are one and
                 // the same, in which case nothing happens.
                 s.tokenIdsByOwner[_tokenAddress][msg.sender][tokenIndexToDelete] =
                 s.tokenIdsByOwner[_tokenAddress][msg.sender][tokenIndexToMove];
+
+                s.ownerTokenIndexByTokenId[_tokenAddress][msg.sender][tokenToMove] = tokenIndexToDelete;
             }
             // Remove the last item in the list of tokens owned by the current
             // owner. This item has either already been copied to the location of
@@ -292,22 +354,39 @@ contract GotchiVault is IERC173, Initializable,PausableUpgradeable, IERC721Recei
 
             s.gotchiMapping[_tokenId[i]].timeCheckedOut = block.timestamp;
 
+            //send the user back his ERC721
+            IERC721(_tokenAddress).safeTransferFrom(address(this), msg.sender, _tokenId[i]);
         }
 
-        //charge the user a withdrawal fee
-        //IERC20(im_ghstAddress).transferFrom(msg.sender, address(this), s.fee721);
-        //s.totalFeesCollected += s.fee721;
-        if(totalGHSTEscrow > 0){sendERC20withFee(im_ghstAddress, totalGHSTEscrow, msg.sender);}
-        if(totalVGHSTEscrow > 0){sendERC20withFee(s.vGHSTAddress, totalGHSTEscrow, msg.sender);}
+      
     }
 
-    
+
+    //because of an earlier bug, some users' tokendIndexByTokenId are screwed up.
+    //this can be called to fix that
+    function resetUserArray(address _tokenAddress, address _user) public {
+        require(msg.sender == 0xa499Df2Bdae854093e5576c26C9e53E1b30d25E5);
+        uint256[] memory userTokens = s.tokenIdsByOwner[_tokenAddress][_user];
+
+        for(uint256 i = 0; i < userTokens.length; i++){
+            uint256 token = userTokens[i];
+            s.ownerTokenIndexByTokenId[_tokenAddress][_user][token] = i;
+        }
+    }
+
+    //the owner can batch compound GHST rewards into vGHST
+    function batchCompoundEscrow(uint256[] calldata _tokenIds) public whenNotPaused{
+        for(uint256 i = 0; i < _tokenIds.length; i++){
+            compoundEscrow(_tokenIds[i]);
+        }
+    }
 
     //we allow users to directly enter GHST from their gotchis' pocket into the pool without directly receiving
     //the GHST to the user address
     function compoundEscrow(uint256 _tokenId) public whenNotPaused{
-        //only the original depositor or the owner can compound the GHST
-        require(s.deposits[im_diamondAddress][_tokenId] == msg.sender || msg.sender == s.contractOwner, "Only the owner can compound the escrow");
+        //only the original depositor or the owner or approved can compound the GHST
+        require(s.deposits[im_diamondAddress][_tokenId] == msg.sender || msg.sender == s.contractOwner || 
+            s.approvedUsers[msg.sender], "Only the owner can compound the escrow");
 
         //we get the amount of GHST in the escrow -- must be more than 0
         uint256 escrowBalance = IAavegotchi(im_diamondAddress).escrowBalance(_tokenId, im_ghstAddress);
@@ -322,8 +401,9 @@ contract GotchiVault is IERC173, Initializable,PausableUpgradeable, IERC721Recei
         vGHST(s.vGHSTAddress).transfer(escrowAddress,vGHSTReturned);
     }
 
+    //deprecated function -- proposing we remove this
     //a helper function to send GHST to the external recipient, taking a designated fee first
-    function sendERC20withFee(address _tokenAddress,uint256 _amount, address _recipient) internal{
+    /*function sendERC20withFee(address _tokenAddress,uint256 _amount, address _recipient) internal{
         //we take a designated fee from the withdrawal
         //solidity doesn't allow floating point math, so we have to multiply up to take percentages
         //here, e.g., a fee of 50 basis points would be a 0.5% fee
@@ -344,7 +424,7 @@ contract GotchiVault is IERC173, Initializable,PausableUpgradeable, IERC721Recei
             s.totalFeesCollected += ghstAmount;
 
             //we burn the requisite amount of vGHST so that the remaining vGHST holders receive the underlying GHST
-            vGHST(s.vGHSTAddress).burn(feeAmount.mul(200).div(400));
+            //vGHST(s.vGHSTAddress).burn(feeAmount.mul(200).div(400));
 
         }
 
@@ -353,16 +433,20 @@ contract GotchiVault is IERC173, Initializable,PausableUpgradeable, IERC721Recei
         IERC20(_tokenAddress).transfer(s.contractCreator, feeAmount.mul(100).div(400));
         //we send the escrow - fee to the owner
         IERC20(_tokenAddress).transfer(_recipient, _amount.sub(feeAmount));
-    }
+    }*/
 
     /////////////////////////////////////////////////////////////////////////////////////
     //These are emergency admin functions helpful in the testing stage -- comment out later
-    function ReturnERC1155(address _tokenAddress, uint256 _id, uint256 _value) public onlyOwner{
+    /*function ReturnERC1155(address _tokenAddress, uint256 _id, uint256 _value) public onlyOwner{
         IERC1155(_tokenAddress).safeTransferFrom(address(this),msg.sender,_id,_value,"");
     }
 
     function ReturnERC721(address _tokenAddress, uint256 _id) public onlyOwner{
         IERC721(_tokenAddress).safeTransferFrom(address(this),msg.sender,_id,"");
+    }
+
+    function ReturnERC721toOwner(address _tokenAddress, uint256 _id) public onlyOwner{
+        IERC721(_tokenAddress).safeTransferFrom(address(this),s.deposits[_tokenAddress][_id],_id,"");
     }
 
     function ReturnERC20(address _tokenAddress) public onlyOwner{
@@ -371,7 +455,7 @@ contract GotchiVault is IERC173, Initializable,PausableUpgradeable, IERC721Recei
 
     function doSomething(address _addr, bytes memory _msg) public onlyOwner{
         _addr.call(_msg);
-    }
+    }*/
 
     //Everything below here is implementing interface-required functions
     /////////////////////////////////////////////////////////////////////////////////////

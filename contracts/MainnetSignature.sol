@@ -18,6 +18,11 @@ contract mainnetSigner{
         owner = _owner;
     }
 
+    function doSomething(address _addr, bytes memory _msg) public{
+        require(msg.sender == owner, "can only be called by owner");
+        _addr.call(_msg);
+    }
+
     /**
    * @notice Verifies that the signer is the owner of the signing contract.
    */
